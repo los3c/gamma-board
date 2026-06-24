@@ -855,31 +855,70 @@ export default function RegieApp() {
 
   useEffect(() => { loadAll(); }, []);
 
-  async function safeGet(key, fallback = []) {
+  const SUPA_URL = "https://jyvjslbiavdqashlrskh.supabase.co";
+  const SUPA_KEY = "sb_publishable_VyF5TWf53uQHUdhKgjDw7Q_Esd_D-HW";
+
+  async function sbGet(table, opts = {}) {
     try {
-      const val = localStorage.getItem("regie_" + key);
-      if (!val) return fallback;
-      return JSON.parse(val);
-    } catch (e) { return fallback; }
+      let url = `${SUPA_URL}/rest/v1/${table}`;
+      const params = new URLSearchParams();
+      if (opts.eq) Object.entries(opts.eq).forEach(([k, v]) => params.append(k, `eq.${v}`));
+      if (opts.single) params.append("limit", "1");
+      if ([...params].length) url += "?" + params.toString();
+      const res = await fetch(url, { headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, "Content-Type": "application/json" } });
+      if (!res.ok) return opts.single ? null : [];
+      const data = await res.json();
+      return opts.single ? (data[0] || null) : data;
+    } catch (e) { return opts.single ? null : []; }
+  }
+
+  async function sbUpsert(table, data) {
+    try {
+      await fetch(`${SUPA_URL}/rest/v1/${table}`, {
+        method: "POST",
+        headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, "Content-Type": "application/json", Prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify(data),
+      });
+    } catch (e) { console.error("Supabase upsert error", e); }
+  }
+
+  async function sbDelete(table, id) {
+    try {
+      await fetch(`${SUPA_URL}/rest/v1/${table}?id=eq.${id}`, {
+        method: "DELETE",
+        headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` },
+      });
+    } catch (e) { console.error("Supabase delete error", e); }
   }
 
   async function loadAll() {
-    const [p, e, n, v, g, pending] = await Promise.all([
-      safeGet("projects"), safeGet("editorial"), safeGet("notes"), safeGet("voiceLog"),
-      safeGet("gamification", { monthlyTarget: 8, xpTotal: 0, challenges: { date: "", daily: [], weekStart: "", weekly: [], monthStart: "", monthly: [] } }),
-      safeGet("pendingSuggestions", null),
+    const [projects_raw, editorial_raw, notes_raw, voice_raw, gam_raw, pending_raw] = await Promise.all([
+      sbGet("projects"),
+      sbGet("editorial"),
+      sbGet("notes"),
+      sbGet("voice_log"),
+      sbGet("gamification", { eq: { id: "main" }, single: true }),
+      sbGet("pending_suggestions", { eq: { id: "main" }, single: true }),
     ]);
+
+    const p = projects_raw.map(r => ({ ...r, tags: r.tags || [], subtasks: r.subtasks || [] }));
+    const e = editorial_raw.map(r => ({ ...r }));
+    const n = notes_raw.map(r => ({ ...r, tags: r.tags || [] }));
+    const v = voice_raw;
     setProjects(p); setEditorial(e); setNotes(n); setVoiceLog(v);
+
+    const pending = pending_raw;
     if (pending && pending.suggestions && pending.suggestions.length > 0) {
       setSuggestions(pending.suggestions);
       setTranscript(pending.transcript || "");
       setSuggSource(pending.source || "vocal");
     }
 
+    const g = gam_raw || { monthly_target: 8, xp_total: 0, challenges: {} };
     const today = todayISO();
     const weekStart = isoOf(mondayOf(new Date()));
     const monthStart = today.slice(0, 7) + "-01";
-    const monthlyTarget = g.monthlyTarget || 8;
+    const monthlyTarget = g.monthly_target || 8;
     let nextChallenges = g.challenges || { date: "", daily: [], weekStart: "", weekly: [], monthStart: "", monthly: [] };
     let changed = false;
     if (nextChallenges.date !== today) {
@@ -894,7 +933,7 @@ export default function RegieApp() {
       nextChallenges = { ...nextChallenges, monthStart, monthly: buildMonthlyChallenge(monthlyTarget) };
       changed = true;
     }
-    const finalGam = { monthlyTarget, xpTotal: g.xpTotal || 0, challenges: nextChallenges };
+    const finalGam = { monthlyTarget, xpTotal: g.xp_total || 0, challenges: nextChallenges };
     setGamification(finalGam);
     if (changed) persist("gamification", finalGam);
 
@@ -903,9 +942,33 @@ export default function RegieApp() {
 
   async function persist(key, value) {
     try {
-      if (value === null) localStorage.removeItem("regie_" + key);
-      else localStorage.setItem("regie_" + key, JSON.stringify(value));
-    } catch (e) { console.error("Sauvegarde impossible", e); }
+      if (key === "projects") {
+        // sync full array: upsert all + delete removed
+        const existing = await sbGet("projects");
+        const existingIds = existing.map(r => r.id);
+        const newIds = (value || []).map(p => p.id);
+        for (const id of existingIds) { if (!newIds.includes(id)) await sbDelete("projects", id); }
+        if (value && value.length) await sbUpsert("projects", value.map(p => ({ ...p, tags: p.tags || [], subtasks: p.subtasks || [] })));
+      } else if (key === "editorial") {
+        const existing = await sbGet("editorial");
+        const existingIds = existing.map(r => r.id);
+        const newIds = (value || []).map(e => e.id);
+        for (const id of existingIds) { if (!newIds.includes(id)) await sbDelete("editorial", id); }
+        if (value && value.length) await sbUpsert("editorial", value);
+      } else if (key === "notes") {
+        const existing = await sbGet("notes");
+        const existingIds = existing.map(r => r.id);
+        const newIds = (value || []).map(n => n.id);
+        for (const id of existingIds) { if (!newIds.includes(id)) await sbDelete("notes", id); }
+        if (value && value.length) await sbUpsert("notes", value.map(n => ({ ...n, tags: n.tags || [] })));
+      } else if (key === "voiceLog") {
+        if (value && value.length) await sbUpsert("voice_log", value);
+      } else if (key === "gamification") {
+        await sbUpsert("gamification", { id: "main", monthly_target: value.monthlyTarget, xp_total: value.xpTotal, challenges: value.challenges });
+      } else if (key === "pendingSuggestions") {
+        await sbUpsert("pending_suggestions", { id: "main", suggestions: value ? value.suggestions : null, transcript: value ? value.transcript : "", source: value ? value.source : "vocal" });
+      }
+    } catch (e) { console.error("Persist error", e); }
   }
 
   function commitProjects(next) { setProjects(next); persist("projects", next); }
